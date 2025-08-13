@@ -56,12 +56,12 @@ async function getModelResponse(userMessage: string, model: any): Promise<string
 async function generateContext(query: string, model: any): Promise<string> {
     try {
         // PSE 검색 쿼리 생성
-        // const queryContext = `다음 질문에 대해 효과적인 Search Engine 쿼리 1건 생성, 단답형: ${query}`;
-        // let searchQuery = await getModelResponse(queryContext, model);
+        const queryContext = `다음 질문에 대해 검색엔진 최적화 키워드 2-4단어 이내로 하나의 문장 생성해줘. 키워드만 답변해주면 되고, 가장 중요한 핵심 키워드 큰따옴표로 감싸줘. 그 외에 다른 말은 하지마: ${query}`;
+        let searchQuery = await getModelResponse(queryContext, model);
         // // searchQuery = cleanSearchQuery(searchQuery); // 검색 쿼리 정리
-        // console.log('생성된 PSE 검색 쿼리:', searchQuery);
+        console.log('생성된 PSE 검색 쿼리:', searchQuery);
         // PSE 검색 실행
-        const searchResults = await performPSESearch(query);
+        const searchResults = await performPSESearch(searchQuery);
         
         // 검색 결과가 있으면 요약 생성
         if (searchResults && searchResults.length > 0) {
@@ -75,44 +75,6 @@ async function generateContext(query: string, model: any): Promise<string> {
         return ''; // 오류 시 빈 컨텍스트로 fallback
     }
 }
-
-
-// 검색 쿼리 정리 함수 추가
-// function cleanSearchQuery(query: string): string {
-//     // 입력이 없거나 undefined인 경우 처리
-//     if (!query) return '';
-    
-//     // 줄바꿈, 특수 기호 제거
-//     let cleaned = query.trim();
-    
-//     // 추천:, 검색어:, 쿼리: 등으로 시작하는 경우 해당 부분 제거
-//     cleaned = cleaned.replace(/^(추천:|검색어:|쿼리:|검색 쿼리:|효과적인 검색 쿼리:|PSE 검색 쿼리:)\s*/i, '');
-    
-//     // 설명이 포함된 경우 첫 줄만 사용
-//     if (cleaned && cleaned.includes('\n')) {
-//         const lines = cleaned.split('\n');
-//         // 명시적으로 첫 번째 요소가 존재하는지 확인
-//         const firstLine = lines.length > 0 ? lines[0] : '';
-//         try {
-//             cleaned = firstLine.trim();    
-//         } catch (error) {
-//             console.error('첫 줄 처리 중 오류 발생:', error);
-//             return query; // 오류 발생 시 원본 쿼리 반환
-//         }
-//     }
-    
-//     // 불필요한 마크다운 포맷 제거
-//     if (cleaned) {
-//         cleaned = cleaned.replace(/^\*\*|\*\*$/g, '').replace(/^#+ /g, '');
-//     }
-    
-//     // 앞뒤 따옴표만 있는 경우 제거 (검색 쿼리 자체에 따옴표가 필요한 경우 제외)
-//     if (cleaned && cleaned.startsWith('"') && cleaned.endsWith('"') && cleaned.split('"').length === 3) {
-//         cleaned = cleaned.substring(1, cleaned.length - 1);
-//     }
-    
-//     return cleaned || '';
-// }
 
 // PSE 검색 함수
 async function performPSESearch(query: string): Promise<any[]> {
@@ -162,12 +124,16 @@ async function handleMessage(message: Message, model: any) {
 
     try {
         let thread;
+        let messageContext = ''; // 질의에 대해 컨텍스트 유지하기 위한 
 
         // 이미 스레드가 있는 경우 해당 스레드 사용
         if (message.channel.isThread()) {
             // 이미 스레드 내에 있으면 해당 스레드 사용
             thread = message.channel;
             console.log('기존 스레드에 응답합니다:', thread.name);
+
+            messageContext = `질의 스레드 주제:${thread.name}\n\n사용자 질의: ${message.content}`;
+
         } else {
             // 스레드가 없는 경우 새로 생성
             const channel = message.channel as TextChannel;
@@ -176,16 +142,20 @@ async function handleMessage(message: Message, model: any) {
                 autoArchiveDuration: 60, // 60분 후 자동 보관
                 reason: '사용자 질문에 대한 답변 스레드 생성'
             });
+
+            messageContext = `사용자 질의: ${message.content}`;
         }
 
         // 스레드에 "생각 중..." 메시지 전송
         const loadingMessage = await thread.send('생각 중...');
 
         // 컨텍스트 생성
-        const searchContext = await generateContext(message.content, model);
+        // const searchContext = await generateContext(message.content, model);
+        console.log(`질의에 관한 컨텍스트: ${messageContext}`)
+        const searchContext = await generateContext(messageContext, model);
         // 컨텍스트가 있으면 프롬프트에 포함
         const enhancedQuery = searchContext 
-            ? `참고 정보:\n${searchContext}\n\n사용자 질문: ${message.content}`
+            ? `참고 정보:\n${searchContext}\n\n사용자 질문: ${message.content}\n\n질의 주제: ${thread.name}`
             : message.content;
 
         console.log('사용자 질문:', message.content);
