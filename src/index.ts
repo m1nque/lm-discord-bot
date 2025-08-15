@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import { LMStudioClient } from '@lmstudio/sdk';
 import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
 import { splitResponseIntoChunks } from './util/string.js';
+import { getCurrentDateTime, getWeather, formatWeatherInfo } from './util/weather.js';
 
 dotenv.config();
 
@@ -35,7 +36,7 @@ async function getLLMModel(): Promise<any> {
 async function getModelResponse(userMessage: string, model: any): Promise<string> {
     try {
         const prediction = await model.respond([
-            { role: 'system', content: '당신은 도움이 되는 디스코드 봇입니다.' },
+            { role: 'system', content: '당신은 도움이 되는 디스코드 봇입니다. 현재 날짜와 시간, 날씨 정보에 접근할 수 있습니다.' },
             { role: 'user', content: userMessage },
         ],
         {
@@ -65,7 +66,7 @@ async function generateContext(query: string, model: any): Promise<string> {
         
         // 검색 결과가 있으면 요약 생성
         if (searchResults && searchResults.length > 0) {
-            const contextSummary = await summarizeSearchResults(searchResults, model);
+            const contextSummary = await summarizeSearchResults(query, searchResults, model);
             return contextSummary;
         }
         
@@ -80,13 +81,15 @@ async function generateContext(query: string, model: any): Promise<string> {
 async function performPSESearch(query: string): Promise<any[]> {
     const PSE_API_KEY = process.env.GOOGLE_PSE_API_KEY;
     const PSE_ENGINE_ID = process.env.GOOGLE_PSE_ENGINE_ID;
-    
+
+    const searchCount = process.env.GOOGLE_PSE_COUNT ? process.env.GOOGLE_PSE_COUNT : '5'; // 기본값 5
+
     const searchUrl = `https://www.googleapis.com/customsearch/v1`;
     const params = new URLSearchParams({
         key: PSE_API_KEY!,
         cx: PSE_ENGINE_ID!,
         q: query,
-        num: '5' // 검색 결과 5건
+        num: searchCount // 검색 결과 5건
     });
     
     const response = await fetch(`${searchUrl}?${params}`);
@@ -96,20 +99,25 @@ async function performPSESearch(query: string): Promise<any[]> {
 }
 
 // 검색 결과 요약 함수
-async function summarizeSearchResults(results: any[], model: any): Promise<string> {
+async function summarizeSearchResults(query: string, results: any[], model: any): Promise<string> {
     const searchContent = results.map((item, index) => 
         `[${index + 1}] ${item.title}\n${item.snippet}\n`
     ).join('\n');
     
     // 간단한 요약 프롬프트
     const summaryPrompt = `
-다음 검색 결과를 바탕으로 핵심 내용만 간단히 요약해주세요:
+다음 검색 결과를 바탕으로 핵심 내용만 간단히 요약해주세요. 질의와 상관없는 검색 결과는 제외합니다.
+${query}
 
+검색 결과:
 ${searchContent}
+
 
 요약:`;
 
+    console.log('-- 요약 프롬프트 생성 완료 --');
     console.log('요약 요청 프롬프트:', summaryPrompt);
+    console.log('-- 요약 프롬프트 생성 완료 --');
     
     // LM Studio로 요약 요청 (모델 객체 사용)
     const summary = await getModelResponse(summaryPrompt, model);
@@ -152,14 +160,30 @@ async function handleMessage(message: Message, model: any) {
         // 컨텍스트 생성
         // const searchContext = await generateContext(message.content, model);
         console.log(`질의에 관한 컨텍스트: ${messageContext}`)
+        
+        // 날씨/날짜 정보 요청인지 확인하고 처리
+        const weatherDateResult = await processWeatherAndDateRequests(message.content);
+        
+        // RAG 컨텍스트 생성
         const searchContext = await generateContext(messageContext, model);
+        
+        // 컨텍스트 정보 합치기 (날씨/날짜 + 검색 결과)
+        let combinedContext = '';
+        if (weatherDateResult.isProcessed && weatherDateResult.contextInfo) {
+            combinedContext += weatherDateResult.contextInfo;
+        }
+        if (searchContext) {
+            combinedContext += searchContext;
+        }
+        
         // 컨텍스트가 있으면 프롬프트에 포함
-        const enhancedQuery = searchContext 
-            ? `참고 정보:\n${searchContext}\n\n사용자 질문: ${message.content}\n\n질의 주제: ${thread.name}`
+        const enhancedQuery = combinedContext 
+            ? `참고 정보:\n${combinedContext}\n\n사용자 질문: ${message.content}\n\n질의 주제: ${thread.name}`
             : message.content;
 
         console.log('사용자 질문:', message.content);
-        console.log('생성된 컨텍스트:', searchContext);
+        console.log('날씨/날짜 정보:', weatherDateResult.isProcessed ? '포함됨' : '포함되지 않음');
+        console.log('생성된 검색 컨텍스트:', searchContext);
         console.log('강화된 쿼리:', enhancedQuery);
 
         // LLM에서 응답 가져오기
@@ -180,6 +204,82 @@ async function handleMessage(message: Message, model: any) {
     } catch (error) {
         console.error('메시지 처리 중 오류 발생:', error);
     }
+}
+
+// 날씨 및 날짜 정보 요청 감지 및 처리
+async function processWeatherAndDateRequests(message: string): Promise<{
+  isProcessed: boolean;
+  contextInfo?: string;
+}> {
+  // 메시지 소문자로 변환하여 비교
+  const lowerMsg = message.toLowerCase();
+  
+  // 날짜/시간 관련 키워드
+  const dateTimeKeywords = ['날짜', '시간', '요일', '몇 시', '며칠', '오늘'];
+  // 날씨 관련 키워드
+  const weatherKeywords = ['날씨', '기온', '온도', '습도', '바람', '기상'];
+  
+  // 위치 패턴 감지 (다양한 형태의 위치 질문 처리)
+  // 예: "서울 날씨", "부산 날씨 알려줘", "오늘 서울 날씨 어때?"
+  const locationPattern = /([가-힣]+[시군구]?)(?:\s+|의\s*|\s*지역\s*)(날씨|기온|온도|습도|바람|기상)/;
+  // 백업 패턴 (위 패턴이 매치되지 않을 경우)
+  const backupLocationPattern = /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)(?:\s+|에|의|지역)?/;
+  const locationMatch = message.match(locationPattern);
+  
+  let contextInfo = '';
+  let isProcessed = false;
+  
+  // 날짜/시간 정보 요청 감지
+  if (dateTimeKeywords.some(keyword => lowerMsg.includes(keyword))) {
+    const dateTimeInfo = getCurrentDateTime();
+    contextInfo += `현재 날짜와 시간: ${dateTimeInfo.fullDateTime}\n\n`;
+    isProcessed = true;
+  }
+  
+  // 날씨 정보 요청 감지
+  if (weatherKeywords.some(keyword => lowerMsg.includes(keyword))) {
+    try {
+      // 위치 추출 시도
+      let location = '서울'; // 기본값
+      
+      // 첫 번째 패턴으로 위치 추출 시도
+      const locationMatch = message.match(locationPattern);
+      if (locationMatch && locationMatch[1]) {
+        location = locationMatch[1];
+      } else {
+        // 백업 패턴으로 위치 추출 시도
+        const backupMatch = message.match(backupLocationPattern);
+        if (backupMatch && backupMatch[1]) {
+          location = backupMatch[1];
+        }
+      }
+      
+      console.log(`날씨 정보 요청 감지 - 위치: ${location}`);
+      
+      try {
+        const weatherData = await getWeather(location);
+        
+        if (weatherData) {
+          contextInfo += formatWeatherInfo(weatherData) + '\n\n';
+          console.log('날씨 정보 포맷팅 완료');
+        }
+      } catch (weatherError) {
+        console.error('날씨 API 호출 중 오류:', weatherError);
+        contextInfo += `날씨 정보를 제공할 수 없습니다. OpenWeatherMap API 키가 아직 활성화되지 않았거나 유효하지 않습니다.\n\n현재 서비스 상태를 확인 중입니다. 나중에 다시 시도해주세요.\n\n`;
+        
+        // 개발자용 로그
+        console.log('날씨 API 키 확인 필요:', process.env.OPENWEATHER_API_KEY);
+      }
+      
+      isProcessed = true;
+    } catch (error) {
+      console.error('날씨 정보 처리 중 오류:', error);
+      contextInfo += `날씨 정보를 가져오는 데 문제가 발생했습니다.\n\n`;
+      isProcessed = true;
+    }
+  }
+  
+  return { isProcessed, contextInfo };
 }
 
 // 봇 실행 함수
