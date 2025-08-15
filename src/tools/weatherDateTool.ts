@@ -152,11 +152,19 @@ export class WeatherDateTool {
   /**
    * 날씨 정보를 텍스트로 포맷팅
    * @param weatherData - 날씨 정보 객체
+   * @param skipLocationHeader - 위치 헤더를 건너뛸지 여부 (커스텀 헤더가 이미 추가된 경우)
    * @returns 포맷팅된 날씨 정보 문자열
    */
-  formatWeatherInfo(weatherData: any): string {
-    let formattedInfo = `
-📍 **${weatherData.location}** 날씨 정보:
+  formatWeatherInfo(weatherData: any, skipLocationHeader: boolean = false): string {
+    let formattedInfo = '';
+    
+    // 위치 헤더 추가 여부
+    if (!skipLocationHeader) {
+      formattedInfo += `
+📍 **${weatherData.location}** 날씨 정보:`;
+    }
+    
+    formattedInfo += `
 - 날짜: ${this.getCurrentDateTime().date}
 - 날씨: ${weatherData.description}
 - 현재 기온: ${weatherData.temperature}°C (체감 온도: ${weatherData.feelsLike}°C)
@@ -191,12 +199,24 @@ export class WeatherDateTool {
     // 백업 패턴 (위 패턴이 매치되지 않을 경우)
     const backupLocationPattern = /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)(?:\s+|에|의|지역)?/;
     
+    // 시간 관련 키워드 목록 (위치로 잘못 인식되지 않도록)
+    const timeKeywords = [
+      '오늘', '내일', '모레', '어제', '그제', '아침', '점심', '저녁', '밤', '새벽',
+      '지금', '현재', '방금', '이번주', '다음주', '지난주', '이번달', '다음달', '지난달',
+      '주말', '평일', '월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일'
+    ];
+    
     let location = '서울'; // 기본값
     
     // 첫 번째 패턴으로 위치 추출 시도
     const locationMatch = message.match(locationPattern);
     if (locationMatch && locationMatch[1]) {
-      location = locationMatch[1];
+      const potentialLocation = locationMatch[1];
+      
+      // 시간 관련 키워드인지 확인
+      if (!timeKeywords.includes(potentialLocation)) {
+        location = potentialLocation;
+      }
     } else {
       // 백업 패턴으로 위치 추출 시도
       const backupMatch = message.match(backupLocationPattern);
@@ -205,6 +225,7 @@ export class WeatherDateTool {
       }
     }
     
+    console.log(`추출된 위치: ${location} (입력: ${message})`);
     return location;
   }
 
@@ -216,6 +237,7 @@ export class WeatherDateTool {
   async processWeatherAndDateRequests(message: string): Promise<{
     isProcessed: boolean;
     contextInfo?: string;
+    jsonData?: any; // JSON 형식 데이터 추가
   }> {
     // 메시지 소문자로 변환하여 비교
     const lowerMsg = message.toLowerCase();
@@ -227,46 +249,144 @@ export class WeatherDateTool {
     
     let contextInfo = '';
     let isProcessed = false;
+    let jsonData: any = {}; // JSON 데이터 초기화
     
     // 날짜/시간 정보 요청 감지
     if (dateTimeKeywords.some(keyword => lowerMsg.includes(keyword))) {
       const dateTimeInfo = this.getCurrentDateTime();
       contextInfo += `현재 날짜와 시간: ${dateTimeInfo.fullDateTime}\n\n`;
+      jsonData.dateTime = dateTimeInfo; // 날짜/시간 정보 JSON에 추가
       isProcessed = true;
     }
     
     // 날씨 정보 요청 감지
     if (weatherKeywords.some(keyword => lowerMsg.includes(keyword))) {
       try {
-        // 위치 추출
-        const location = this.extractLocationFromMessage(message);
+        // 날짜 패턴 확인 (예: "8월 8일 날씨", "3월 15일 날씨 어때?")
+        const dateWeatherPattern = /(\d+)월\s*(\d+)일\s*(날씨|기온|온도)/;
+        // 순수 날씨 요청 패턴 확인 (예: "오늘 날씨", "지금 날씨 어때?")
+        const simpleWeatherPattern = /^(오늘|지금|현재|내일|모레)?\s*(날씨|기온|온도)(\s*어때|\s*알려|를\s*알려|\s*좀|가\s*어때)?/;
         
-        console.log(`날씨 정보 요청 감지 - 위치: ${location}`);
+        let location = '서울'; // 기본값
+        let dateInfo = '';
+        
+        // 날짜 패턴 확인
+        const dateMatch = message.match(dateWeatherPattern);
+        if (dateMatch) {
+          const month = parseInt(dateMatch[1] || '1');
+          const day = parseInt(dateMatch[2] || '1');
+          
+          // 현재 날짜 기준으로 날짜 정보 추가
+          const now = new Date();
+          const currentYear = now.getFullYear();
+          dateInfo = `${currentYear}년 ${month}월 ${day}일 `;
+          
+          // JSON 데이터에 날짜 정보 추가
+          jsonData.specificDate = {
+            year: currentYear,
+            month: month,
+            day: day,
+            formatted: `${currentYear}년 ${month}월 ${day}일`
+          };
+          
+          console.log(`날짜 패턴 감지 - ${dateInfo}의 날씨 요청`);
+        }
+        // 단순 날씨 패턴 확인
+        else if (simpleWeatherPattern.test(message.trim())) {
+          console.log('일반적인 날씨 요청 감지 - 기본 위치(서울) 사용');
+        } else {
+          // 위치 추출 시도
+          location = this.extractLocationFromMessage(message);
+        }
+        
+        console.log(`날씨 정보 요청 감지 - 사용할 위치: ${location}${dateInfo ? ', 날짜: ' + dateInfo : ''}`);
         
         try {
           const weatherData = await this.getWeather(location);
           
           if (weatherData) {
-            contextInfo += this.formatWeatherInfo(weatherData) + '\n\n';
+            // 날짜 정보가 있으면 응답에 포함
+            if (dateInfo) {
+              contextInfo += `${dateInfo}${weatherData.location} 날씨 정보:\n`;
+              contextInfo += this.formatWeatherInfo(weatherData, true) + '\n\n';
+            } else {
+              contextInfo += this.formatWeatherInfo(weatherData) + '\n\n';
+            }
+            
+            // JSON 데이터에 날씨 정보 추가
+            jsonData.weather = {
+              ...weatherData,
+              requestedLocation: location,
+              requestedDate: dateInfo ? dateInfo.trim() : '현재'
+            };
+            
             console.log('날씨 정보 포맷팅 완료');
           }
-        } catch (weatherError) {
-          console.error('날씨 API 호출 중 오류:', weatherError);
-          contextInfo += `날씨 정보를 제공할 수 없습니다. OpenWeatherMap API 키가 아직 활성화되지 않았거나 유효하지 않습니다.\n\n현재 서비스 상태를 확인 중입니다. 나중에 다시 시도해주세요.\n\n`;
+        } catch (error: any) {
+          console.error('날씨 API 호출 중 오류:', error);
+          
+          if (error.message && error.message.includes('위치 정보를 찾을 수 없습니다')) {
+            contextInfo += `죄송합니다. "${location}" 지역의 날씨 정보를 찾을 수 없습니다.\n현재 서울의 날씨를 알려드릴까요?\n\n`;
+            
+            // JSON 데이터에 오류 정보 추가
+            jsonData.error = {
+              type: 'locationNotFound',
+              requestedLocation: location,
+              message: `${location} 지역의 날씨 정보를 찾을 수 없습니다.`
+            };
+            
+            // 기본 위치(서울)로 재시도
+            try {
+              const defaultWeatherData = await this.getWeather('서울');
+              if (defaultWeatherData) {
+                contextInfo += this.formatWeatherInfo(defaultWeatherData) + '\n\n';
+                
+                // 기본 위치 날씨 정보 추가
+                jsonData.fallbackWeather = {
+                  ...defaultWeatherData,
+                  requestedLocation: '서울',
+                  isFallback: true
+                };
+              }
+            } catch (fallbackError) {
+              contextInfo += `날씨 정보를 제공할 수 없습니다. 잠시 후 다시 시도해주세요.\n\n`;
+            }
+          } else {
+            contextInfo += `날씨 정보를 제공할 수 없습니다. OpenWeatherMap API 키가 아직 활성화되지 않았거나 유효하지 않습니다.\n\n현재 서비스 상태를 확인 중입니다. 나중에 다시 시도해주세요.\n\n`;
+            
+            // JSON 데이터에 API 오류 정보 추가
+            jsonData.error = {
+              type: 'apiError',
+              message: '날씨 API 호출 중 오류가 발생했습니다.'
+            };
+          }
           
           // 개발자용 로그
           console.log('날씨 API 키 확인 필요:', this.apiKey);
         }
         
         isProcessed = true;
-      } catch (error) {
+      } catch (error: any) {
         console.error('날씨 정보 처리 중 오류:', error);
-        contextInfo += `날씨 정보를 가져오는 데 문제가 발생했습니다.\n\n`;
+        
+        // 오류 메시지 개선
+        if (error.message) {
+          contextInfo += `날씨 정보를 가져오는 데 문제가 발생했습니다: ${error.message}\n\n`;
+        } else {
+          contextInfo += `날씨 정보를 가져오는 데 문제가 발생했습니다.\n\n`;
+        }
+        
+        // JSON 데이터에 일반 오류 정보 추가
+        jsonData.error = {
+          type: 'generalError',
+          message: error.message || '날씨 정보를 가져오는 데 문제가 발생했습니다.'
+        };
+        
         isProcessed = true;
       }
     }
     
-    return { isProcessed, contextInfo };
+    return { isProcessed, contextInfo, jsonData };
   }
 }
 

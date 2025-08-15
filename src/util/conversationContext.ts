@@ -1,4 +1,9 @@
 import { createClient } from 'redis';
+import dotenv from 'dotenv';
+import { vectorStore } from './vectorStore.js';
+
+// 환경 변수 로드
+dotenv.config();
 
 /**
  * Redis 클라이언트를 사용하여 대화 맥락을 관리하는 클래스
@@ -6,14 +11,18 @@ import { createClient } from 'redis';
 export class ConversationContext {
   private client: ReturnType<typeof createClient>;
   private initialized: boolean = false;
-  private readonly expirationTime: number = 60 * 60 * 24; // 24시간 (초 단위)
-  private readonly maxHistoryLength: number = 10; // 저장할 최대 대화 쌍 수
+  private readonly expirationTime: number;
+  private readonly maxHistoryLength: number;
   
   /**
    * ConversationContext 생성자
-   * @param redisUrl - Redis 서버 URL (기본값: localhost:6379)
+   * @param redisUrl - Redis 서버 URL (환경 변수에서 가져옴)
    */
-  constructor(redisUrl: string = 'redis://localhost:6379') {
+  constructor() {
+    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    this.expirationTime = parseInt(process.env.REDIS_EXPIRATION_TIME || '86400'); // 24시간 (초 단위)
+    this.maxHistoryLength = parseInt(process.env.REDIS_MAX_HISTORY_LENGTH || '10'); // 저장할 최대 대화 쌍 수
+    
     this.client = createClient({
       url: redisUrl
     });
@@ -65,11 +74,13 @@ export class ConversationContext {
    * @param threadId - 스레드 ID
    * @param userMessage - 사용자 메시지
    * @param botResponse - 봇 응답
+   * @param messageId - 메시지 ID (Discord API 사용 시)
    */
   async saveConversation(
     threadId: string,
     userMessage: string,
-    botResponse: string
+    botResponse: string,
+    messageId?: string
   ): Promise<void> {
     if (!this.initialized) {
       await this.initialize();
@@ -96,6 +107,14 @@ export class ConversationContext {
       
       // 만료 시간 설정 (24시간)
       await this.client.expire(key, this.expirationTime);
+      
+      // 벡터 DB에도 저장 (messageId가 있는 경우)
+      if (messageId) {
+        await vectorStore.storeConversation(threadId, messageId, userMessage, botResponse);
+      } else {
+        const tempMsgId = Date.now().toString(); // 임시 메시지 ID
+        await vectorStore.storeConversation(threadId, tempMsgId, userMessage, botResponse);
+      }
       
       console.log(`스레드 ${threadId}의 대화 이력 저장 완료`);
     } catch (error) {
@@ -232,6 +251,67 @@ ${summaryInput}
   }
   
   /**
+   * 벡터 DB에서 유사한 대화 검색
+   * @param threadId - 스레드 ID
+   * @param query - 검색 쿼리
+   * @param limit - 최대 결과 수
+   * @returns 포맷팅된 유사 대화 컨텍스트
+   */
+  async getSimilarConversations(
+    threadId: string,
+    query: string,
+    limit: number = 3
+  ): Promise<string> {
+    try {
+      const similarConversations = await vectorStore.searchSimilarConversations(
+        threadId,
+        query,
+        limit
+      );
+      
+      if (similarConversations.length === 0) {
+        return '';
+      }
+      
+      // 유사한 대화 포맷팅
+      const formattedContext = similarConversations
+        .map(convo => {
+          return `사용자: ${convo.userMessage}\n봇: ${convo.botResponse}`;
+        })
+        .join('\n\n');
+      
+      return `관련 이전 대화:\n${formattedContext}`;
+    } catch (error) {
+      console.error('유사 대화 검색 중 오류:', error);
+      return '';
+    }
+  }
+  
+  /**
+   * 대화 맥락 검색
+   * 1. 압축된 요약 (Redis에서)
+   * 2. 유사한 대화 (벡터 DB에서)
+   * @param threadId - 스레드 ID
+   * @param currentQuery - 현재 질문
+   * @returns 조합된 컨텍스트
+   */
+  async getContextForQuery(
+    threadId: string,
+    currentQuery: string
+  ): Promise<{ compressedContext: string, similarConversations: string }> {
+    // 압축된 요약 가져오기
+    const compressedContext = await this.getSummary(threadId);
+    
+    // 유사한 대화 검색
+    const similarConversations = await this.getSimilarConversations(threadId, currentQuery);
+    
+    return {
+      compressedContext,
+      similarConversations
+    };
+  }
+  
+  /**
    * 대화 이력 및 압축된 맥락 삭제
    * @param threadId - 스레드 ID
    */
@@ -244,8 +324,12 @@ ${summaryInput}
       const historyKey = this.getThreadKey(threadId, 'history');
       const summaryKey = this.getThreadKey(threadId, 'summary');
       
+      // Redis에서 삭제
       await this.client.del(historyKey);
       await this.client.del(summaryKey);
+      
+      // 벡터 DB에서도 삭제
+      await vectorStore.deleteThreadConversations(threadId);
       
       console.log(`스레드 ${threadId}의 대화 정보 삭제 완료`);
     } catch (error) {
