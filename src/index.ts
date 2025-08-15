@@ -2,7 +2,9 @@ import dotenv from 'dotenv';
 import { LMStudioClient } from '@lmstudio/sdk';
 import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
 import { splitResponseIntoChunks } from './util/string.js';
-import { getCurrentDateTime, getWeather, formatWeatherInfo } from './util/weather.js';
+import { WeatherDateTool } from './tools/weatherDateTool.js';
+import { GooglePSETool } from './tools/googlePSETool.js';
+import { conversationContext } from './util/conversationContext.js';
 
 dotenv.config();
 
@@ -33,17 +35,24 @@ async function getLLMModel(): Promise<any> {
     return loadedModels[0]; // 첫 번째 모델 사용
 }
 
-async function getModelResponse(userMessage: string, model: any): Promise<string> {
+async function getModelResponse(userMessage: string, model: any, systemMessage?: string): Promise<string> {
     try {
-        const prediction = await model.respond([
-            { role: 'system', content: '당신은 도움이 되는 디스코드 봇입니다. 현재 날짜와 시간, 날씨 정보에 접근할 수 있습니다.' },
+        const messages = [
+            { 
+                role: 'system', 
+                content: systemMessage || '당신은 도움이 되는 디스코드 봇입니다. 현재 날짜와 시간, 날씨 정보에 접근할 수 있습니다.'
+            },
             { role: 'user', content: userMessage },
-        ],
-        {
-            max_tokens: 2000, // 생성할 최대 토큰 수 제한
-            // temperature: 0.7, // 응답의 창의성 조절 (선택사항)
-            // top_p: 0.9 // 토큰 샘플링 파라미터 (선택사항)
-        });
+        ];
+        
+        const prediction = await model.respond(
+            messages,
+            {
+                max_tokens: 2000, // 생성할 최대 토큰 수 제한
+                // temperature: 0.7, // 응답의 창의성 조절 (선택사항)
+                // top_p: 0.9 // 토큰 샘플링 파라미터 (선택사항)
+            }
+        );
 
         return prediction.content;
     } catch (error) {
@@ -61,8 +70,12 @@ async function generateContext(query: string, model: any): Promise<string> {
         let searchQuery = await getModelResponse(queryContext, model);
         // // searchQuery = cleanSearchQuery(searchQuery); // 검색 쿼리 정리
         console.log('생성된 PSE 검색 쿼리:', searchQuery);
+        
+        // GooglePSETool 인스턴스 생성
+        const googlePSE = new GooglePSETool();
+        
         // PSE 검색 실행
-        const searchResults = await performPSESearch(searchQuery);
+        const searchResults = await googlePSE.search(searchQuery);
         
         // 검색 결과가 있으면 요약 생성
         if (searchResults && searchResults.length > 0) {
@@ -77,44 +90,18 @@ async function generateContext(query: string, model: any): Promise<string> {
     }
 }
 
-// PSE 검색 함수
-async function performPSESearch(query: string): Promise<any[]> {
-    const PSE_API_KEY = process.env.GOOGLE_PSE_API_KEY;
-    const PSE_ENGINE_ID = process.env.GOOGLE_PSE_ENGINE_ID;
-
-    const searchCount = process.env.GOOGLE_PSE_COUNT ? process.env.GOOGLE_PSE_COUNT : '5'; // 기본값 5
-
-    const searchUrl = `https://www.googleapis.com/customsearch/v1`;
-    const params = new URLSearchParams({
-        key: PSE_API_KEY!,
-        cx: PSE_ENGINE_ID!,
-        q: query,
-        num: searchCount // 검색 결과 5건
-    });
-    
-    const response = await fetch(`${searchUrl}?${params}`);
-    const data = await response.json();
-    
-    return data.items || [];
-}
-
 // 검색 결과 요약 함수
 async function summarizeSearchResults(query: string, results: any[], model: any): Promise<string> {
-    const searchContent = results.map((item, index) => 
-        `[${index + 1}] ${item.title}\n${item.snippet}\n`
-    ).join('\n');
+    // GooglePSETool 인스턴스 생성
+    const googlePSE = new GooglePSETool();
     
-    // 간단한 요약 프롬프트
-    const summaryPrompt = `
-다음 검색 결과를 바탕으로 핵심 내용만 간단히 요약해주세요. 질의와 상관없는 검색 결과는 제외합니다.
-${query}
-
-검색 결과:
-${searchContent}
-
-
-요약:`;
-
+    // 포맷된 검색 결과로 요약 프롬프트 생성
+    const summaryPrompt = googlePSE.generateSummaryPrompt(query, results);
+    
+    if (!summaryPrompt) {
+        return '';
+    }
+    
     console.log('-- 요약 프롬프트 생성 완료 --');
     console.log('요약 요청 프롬프트:', summaryPrompt);
     console.log('-- 요약 프롬프트 생성 완료 --');
@@ -130,8 +117,11 @@ async function handleMessage(message: Message, model: any) {
     // 봇 메시지 무시 및 DM 무시
     if (message.author.bot || !message.guild) return;
 
+    // Discord.js의 스레드 타입이 다양하므로 any 타입으로 처리 (원래는 더 정확한 타입을 사용하는 것이 좋음)
+    let thread: any = null;
+    let loadingMessage: Message | null = null;
+
     try {
-        let thread;
         let messageContext = ''; // 질의에 대해 컨텍스트 유지하기 위한 
 
         // 이미 스레드가 있는 경우 해당 스레드 사용
@@ -155,23 +145,49 @@ async function handleMessage(message: Message, model: any) {
         }
 
         // 스레드에 "생각 중..." 메시지 전송
-        const loadingMessage = await thread.send('생각 중...');
+        loadingMessage = await thread.send('생각 중...');
+
+        // Redis에서 대화 이력 가져오기
+        const threadId = thread.id;
+        
+        // 압축된 맥락 가져오기 (이전 대화의 요약)
+        const compressedContext = await conversationContext.getSummary(threadId);
+        const hasCompressedContext = compressedContext.length > 0;
+        
+        if (hasCompressedContext) {
+            console.log(`스레드 ${threadId}의 압축된 맥락 로드 완료`);
+        }
 
         // 컨텍스트 생성
-        // const searchContext = await generateContext(message.content, model);
         console.log(`질의에 관한 컨텍스트: ${messageContext}`)
         
         // 날씨/날짜 정보 요청인지 확인하고 처리
-        const weatherDateResult = await processWeatherAndDateRequests(message.content);
+        const weatherDateObj = new WeatherDateTool();
+        const weatherDateResult = await weatherDateObj.processWeatherAndDateRequests(message.content);
         
-        // RAG 컨텍스트 생성
-        const searchContext = await generateContext(messageContext, model);
+        // RAG 컨텍스트 생성 (날씨 질의일 경우 검색 건너뜀)
+        let searchContext = '';
+        if (!weatherDateResult.isProcessed) {
+            // 날씨/날짜 관련 질의가 아닐 경우에만 PSE 검색 수행
+            searchContext = await generateContext(messageContext, model);
+        } else {
+            console.log('날씨/날짜 질의로 판단되어 PSE 검색을 건너뜁니다.');
+        }
         
-        // 컨텍스트 정보 합치기 (날씨/날짜 + 검색 결과)
+        // 컨텍스트 정보 합치기 (압축된 맥락 + 날씨/날짜 + 검색 결과)
         let combinedContext = '';
+        
+        // 압축된 맥락이 있는 경우 포함
+        if (hasCompressedContext) {
+            combinedContext += `이전 대화 맥락 요약:\n${compressedContext}\n\n`;
+        }
+        
+        // 날씨/날짜 정보 포함
         if (weatherDateResult.isProcessed && weatherDateResult.contextInfo) {
             combinedContext += weatherDateResult.contextInfo;
         }
+        
+        // 검색 결과 포함
         if (searchContext) {
             combinedContext += searchContext;
         }
@@ -184,13 +200,20 @@ async function handleMessage(message: Message, model: any) {
         console.log('사용자 질문:', message.content);
         console.log('날씨/날짜 정보:', weatherDateResult.isProcessed ? '포함됨' : '포함되지 않음');
         console.log('생성된 검색 컨텍스트:', searchContext);
-        console.log('강화된 쿼리:', enhancedQuery);
+        console.log('압축된 대화 맥락:', hasCompressedContext ? '포함됨' : '포함되지 않음');
+        
+        // 시스템 메시지 구성
+        const systemMessage = `당신은 도움이 되는 디스코드 봇입니다. 현재 날짜와 시간, 날씨 정보에 접근할 수 있습니다. ${
+            hasCompressedContext ? '이전 대화 맥락을 기억하고 일관된 응답을 제공하세요.' : ''
+        }`;
 
         // LLM에서 응답 가져오기
-        const response = await getModelResponse(enhancedQuery, model);
+        const response = await getModelResponse(enhancedQuery, model, systemMessage);
 
         // 로딩 메시지 삭제 후 실제 응답 전송
-        await loadingMessage.delete();
+        if (loadingMessage) {
+            await loadingMessage.delete();
+        }
 
         // response가 2000자 넘을 경우 나눠서 발송
         if (response.length > 2000) {
@@ -201,90 +224,66 @@ async function handleMessage(message: Message, model: any) {
         } else {
             await thread.send(response);
         }
+        
+        // Redis에 대화 저장 및 컨텍스트 압축
+        const conversation = [
+            { role: 'user', content: message.content },
+            { role: 'assistant', content: response }
+        ];
+        
+        try {
+            // 대화 저장 및 컨텍스트 압축 생성
+            await conversationContext.generateAndSaveSummary(
+                threadId,
+                model, // LLM 모델 객체
+                message.content, // 최신 사용자 메시지
+                response // 최신 봇 응답
+            );
+            console.log(`스레드 ${threadId}의 대화 이력 저장 및 컨텍스트 압축 완료`);
+        } catch (redisError) {
+            console.error('Redis에 대화 컨텍스트 저장 중 오류:', redisError);
+        }
+        
     } catch (error) {
         console.error('메시지 처리 중 오류 발생:', error);
-    }
-}
-
-// 날씨 및 날짜 정보 요청 감지 및 처리
-async function processWeatherAndDateRequests(message: string): Promise<{
-  isProcessed: boolean;
-  contextInfo?: string;
-}> {
-  // 메시지 소문자로 변환하여 비교
-  const lowerMsg = message.toLowerCase();
-  
-  // 날짜/시간 관련 키워드
-  const dateTimeKeywords = ['날짜', '시간', '요일', '몇 시', '며칠', '오늘'];
-  // 날씨 관련 키워드
-  const weatherKeywords = ['날씨', '기온', '온도', '습도', '바람', '기상'];
-  
-  // 위치 패턴 감지 (다양한 형태의 위치 질문 처리)
-  // 예: "서울 날씨", "부산 날씨 알려줘", "오늘 서울 날씨 어때?"
-  const locationPattern = /([가-힣]+[시군구]?)(?:\s+|의\s*|\s*지역\s*)(날씨|기온|온도|습도|바람|기상)/;
-  // 백업 패턴 (위 패턴이 매치되지 않을 경우)
-  const backupLocationPattern = /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)(?:\s+|에|의|지역)?/;
-  const locationMatch = message.match(locationPattern);
-  
-  let contextInfo = '';
-  let isProcessed = false;
-  
-  // 날짜/시간 정보 요청 감지
-  if (dateTimeKeywords.some(keyword => lowerMsg.includes(keyword))) {
-    const dateTimeInfo = getCurrentDateTime();
-    contextInfo += `현재 날짜와 시간: ${dateTimeInfo.fullDateTime}\n\n`;
-    isProcessed = true;
-  }
-  
-  // 날씨 정보 요청 감지
-  if (weatherKeywords.some(keyword => lowerMsg.includes(keyword))) {
-    try {
-      // 위치 추출 시도
-      let location = '서울'; // 기본값
-      
-      // 첫 번째 패턴으로 위치 추출 시도
-      const locationMatch = message.match(locationPattern);
-      if (locationMatch && locationMatch[1]) {
-        location = locationMatch[1];
-      } else {
-        // 백업 패턴으로 위치 추출 시도
-        const backupMatch = message.match(backupLocationPattern);
-        if (backupMatch && backupMatch[1]) {
-          location = backupMatch[1];
-        }
-      }
-      
-      console.log(`날씨 정보 요청 감지 - 위치: ${location}`);
-      
-      try {
-        const weatherData = await getWeather(location);
         
-        if (weatherData) {
-          contextInfo += formatWeatherInfo(weatherData) + '\n\n';
-          console.log('날씨 정보 포맷팅 완료');
+        // 오류 발생 시 로딩 메시지 삭제 및 오류 피드백 전송
+        try {
+            if (loadingMessage) {
+                await loadingMessage.delete();
+            }
+            
+            // 사용자에게 오류 알림 전송
+            if (thread) {
+                const errorMessage = `죄송합니다. 요청을 처리하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.`;
+                await thread.send(errorMessage);
+            }
+        } catch (feedbackError) {
+            console.error('오류 피드백 전송 중 추가 오류 발생:', feedbackError);
         }
-      } catch (weatherError) {
-        console.error('날씨 API 호출 중 오류:', weatherError);
-        contextInfo += `날씨 정보를 제공할 수 없습니다. OpenWeatherMap API 키가 아직 활성화되지 않았거나 유효하지 않습니다.\n\n현재 서비스 상태를 확인 중입니다. 나중에 다시 시도해주세요.\n\n`;
-        
-        // 개발자용 로그
-        console.log('날씨 API 키 확인 필요:', process.env.OPENWEATHER_API_KEY);
-      }
-      
-      isProcessed = true;
-    } catch (error) {
-      console.error('날씨 정보 처리 중 오류:', error);
-      contextInfo += `날씨 정보를 가져오는 데 문제가 발생했습니다.\n\n`;
-      isProcessed = true;
     }
-  }
-  
-  return { isProcessed, contextInfo };
 }
 
 // 봇 실행 함수
 async function main() {
     try {
+        // Redis 연결 초기화
+        await conversationContext.initialize();
+        console.log('Redis 대화 컨텍스트 관리자 초기화 완료');
+        
+        // 프로세스 종료 시 Redis 연결 닫기
+        process.on('SIGINT', async () => {
+            console.log('애플리케이션 종료 중...');
+            await conversationContext.disconnect();
+            process.exit(0);
+        });
+        
+        process.on('SIGTERM', async () => {
+            console.log('애플리케이션 종료 중...');
+            await conversationContext.disconnect();
+            process.exit(0);
+        });
+
         // LLM 모델 로드
         const model = await getLLMModel();
         console.log('모델 로드 완료:', model.displayName);
@@ -315,6 +314,12 @@ async function main() {
         await client.login(CLIENT_TOKEN);
     } catch (error) {
         console.error('봇 실행 중 오류 발생:', error);
+        // Redis 연결 종료 시도
+        try {
+            await conversationContext.disconnect();
+        } catch (redisError) {
+            console.error('Redis 연결 종료 중 오류:', redisError);
+        }
     }
 }
 
